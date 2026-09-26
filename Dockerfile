@@ -4,8 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app/store
-COPY target/release/mew_service /app/mew_service
+WORKDIR /app/mew_store
+COPY target/release/mew_store /app/mew_store
 
 EXPOSE 3000
-CMD ["/app/mew_service"]
+CMD ["/app/mew_store"]
