@@ -1,9 +1,14 @@
-use axum::{body::Bytes, extract::State, http::{HeaderMap, HeaderValue, Method, StatusCode}, middleware::Next, response::Response};
-use serde::{Deserialize, Serialize};
+use axum::http::Response;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
+use axum::{body::Bytes, extract::State};
+use std::collections::HashMap;
 
-use crate::store::SharedStore;
+use crate::store::{Operation, Request, Store};
 
-async fn cors(req: axum::extract::Request, next: Next) -> Response {
+pub type SharedStore = std::sync::Arc<Store>;
+
+async fn cors(req: axum::extract::Request, next: Next) -> Response<axum::body::Body> {
     let mut headers = HeaderMap::new();
     headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     headers.insert("access-control-allow-methods", HeaderValue::from_static("*"));
@@ -23,13 +28,9 @@ async fn cors(req: axum::extract::Request, next: Next) -> Response {
     res
 }
 
-// router
 pub async fn run(store: SharedStore) {
     let app = axum::Router::new()
-        .route("/store/get", axum::routing::post(store_get))
-        .route("/store/set", axum::routing::post(store_set))
-        .route("/store/del", axum::routing::post(store_del))
-        .route("/store/list", axum::routing::post(store_list))
+        .route("/store", axum::routing::post(store_op))
         .layer(axum::middleware::from_fn(cors))
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(store);
@@ -39,128 +40,14 @@ pub async fn run(store: SharedStore) {
     axum::serve(listener, app).await.unwrap();
 }
 
-#[derive(Serialize)]
-struct Res<T: Serialize> {
-    status: String,
-    #[serde(flatten)]
-    data: T,
-}
-
-// ReqStoreGet ResStoreGet store_get
-#[derive(Deserialize)]
-struct ReqStoreGet {
-    u: String,
-    k: String,
-}
-
-#[derive(Serialize)]
-struct ResStoreGet {
-    v: String,
-}
-
-async fn store_get(State(state): State<SharedStore>, body: Bytes) -> String {
-    let Ok(req) = serde_json::from_slice::<ReqStoreGet>(&body) else {
-        return serde_json::to_string(&Res {
-            status: "invalid_request".to_string(),
-            data: ResStoreGet { v: String::new() },
-        })
-        .unwrap();
+async fn store_op(State(state): State<SharedStore>, body: Bytes) -> String {
+    let Ok(op) = serde_json::from_slice::<Operation>(&body) else {
+        return serde_json::to_string(&crate::store::Response::Error("invalid_request".to_string())).unwrap();
     };
-    let res = state.lock().await.get(&req.k);
-    let (msg, v) = match res {
-        Ok(v) => (String::new(), v),
-        Err(_) => ("store_error".to_string(), String::new()),
-    };
-    serde_json::to_string(&Res {
-        status: msg,
-        data: ResStoreGet { v },
-    })
-    .unwrap()
-}
 
-// ReqStoreSet ResStoreSet store_set
-#[derive(Deserialize)]
-struct ReqStoreSet {
-    u: String,
-    k: String,
-    v: String,
-}
-
-#[derive(Serialize)]
-struct ResStoreSet {}
-
-async fn store_set(State(state): State<SharedStore>, body: Bytes) -> String {
-    let Ok(req) = serde_json::from_slice::<ReqStoreSet>(&body) else {
-        return serde_json::to_string(&Res {
-            status: "invalid_request".to_string(),
-            data: ResStoreSet {},
-        })
-        .unwrap();
-    };
-    let res = state.lock().await.set(&req.k, &req.v);
-    serde_json::to_string(&Res {
-        status: if res.is_ok() { String::new() } else { "store_error".to_string() },
-        data: ResStoreSet {},
-    })
-    .unwrap()
-}
-
-// ReqStoreList ResStoreList store_list
-#[derive(Deserialize)]
-struct ReqStoreList {
-    u: String,
-    q: String,
-    limit: Option<i64>,
-    cursor: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct ResStoreList {
-    keys: Vec<String>,
-}
-
-async fn store_list(State(state): State<SharedStore>, body: Bytes) -> String {
-    let Ok(req) = serde_json::from_slice::<ReqStoreList>(&body) else {
-        return serde_json::to_string(&Res {
-            status: "invalid_request".to_string(),
-            data: ResStoreList { keys: Vec::new() },
-        })
-        .unwrap();
-    };
-    let limit = req.limit.unwrap_or(-1);
-    let cursor = req.cursor.unwrap_or(0);
-    let res = state.lock().await.list(&req.q, cursor, limit);
-    let (msg, keys) = match res {
-        Ok(keys) => (String::new(), keys),
-        Err(_) => ("store_error".to_string(), Vec::new()),
-    };
-    serde_json::to_string(&Res {
-        status: msg,
-        data: ResStoreList { keys },
-    })
-    .unwrap()
-}
-#[derive(Deserialize)]
-struct ReqStoreDel {
-    u: String,
-    k: String,
-}
-
-#[derive(Serialize)]
-struct ResStoreDel {}
-
-async fn store_del(State(state): State<SharedStore>, body: Bytes) -> String {
-    let Ok(req) = serde_json::from_slice::<ReqStoreDel>(&body) else {
-        return serde_json::to_string(&Res {
-            status: "invalid_request".to_string(),
-            data: ResStoreDel {},
-        })
-        .unwrap();
-    };
-    let res = state.lock().await.del(&req.k);
-    serde_json::to_string(&Res {
-        status: if res.is_ok() { String::new() } else { "store_error".to_string() },
-        data: ResStoreDel {},
-    })
-    .unwrap()
+    let res = state.run(Request::Exec { op, extra: HashMap::new() });
+    match res {
+        crate::store::Response::None => String::new(),
+        _ => serde_json::to_string(&res).unwrap(),
+    }
 }

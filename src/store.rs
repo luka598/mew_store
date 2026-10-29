@@ -1,68 +1,97 @@
-use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "op")]
+pub enum Operation {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
+    Del {
+        key: String,
+    },
+    List {
+        pattern: String,
+        cursor: u64,
+        limit: u64,
+    },
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Request {
+    None,
+    Exec {
+        op: Operation,
+        extra: HashMap<String, String>,
+    },
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Response {
+    None,
+    Error(String),
+    Values(Vec<String>),
+}
 
 pub struct Store {
-    conn: Connection,
+    middleware: Vec<Box<dyn Middleware>>,
 }
 
 impl Store {
-    pub fn new() -> rusqlite::Result<Self> {
-        let conn = Connection::open("store.db")?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            [],
-        )?;
-        Ok(Self { conn })
+    pub fn new() -> Self {
+        Self { middleware: Vec::new() }
     }
 
-    pub fn get(&self, key: &str) -> Result<String, ()> {
-        self.conn
-            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()
-            .map_err(|_| ())?
-            .ok_or(())
+    pub fn add_middleware(mut self, mw: impl Middleware + 'static) -> Self {
+        self.middleware.push(Box::new(mw));
+        self
     }
 
-    pub fn set(&self, key: &str, value: &str) -> Result<(), ()> {
-        self.conn
-            .execute(
-                "INSERT INTO kv (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )
-            .map(|_| ())
-            .map_err(|_| ())
-    }
+    pub fn run(&self, mut req: Request) -> Response {
+        let mut depth: usize = 0;
+        let mut response = None;
 
-    pub fn del(&self, key: &str) -> Result<(), ()> {
-        self.conn
-            .execute("DELETE FROM kv WHERE key = ?1", [key])
-            .map(|_| ())
-            .map_err(|_| ())
-    }
-
-    pub fn list(
-        &self,
-        pattern: &str,
-        cursor: i64,
-        limit: i64,
-    ) -> Result<Vec<String>, ()> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key FROM kv WHERE key GLOB ?1 ORDER BY key LIMIT ?2 OFFSET ?3")
-            .map_err(|_| ())?;
-        let rows = stmt
-            .query_map(rusqlite::params![pattern, limit, cursor], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(|_| ())?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|_| ())?);
+        while depth < self.middleware.len() {
+            match self.middleware[depth].before(req) {
+                Flow::Next(new_req) => {
+                    req = new_req;
+                    depth += 1;
+                }
+                Flow::Return(res) => {
+                    response = Some(res);
+                    break;
+                }
+            }
         }
-        Ok(out)
+
+        let mut response = response.unwrap_or_else(|| Response::Error("no_return".to_string()));
+
+        while depth > 0 {
+            depth -= 1;
+            response = self.middleware[depth].after(response);
+        }
+
+        response
     }
+
 }
 
-pub type SharedStore = std::sync::Arc<tokio::sync::Mutex<Store>>;
+pub enum Flow {
+    Next(Request),
+    Return(Response),
+}
+
+pub trait Middleware: Send + Sync {
+    fn before(&self, req: Request) -> Flow {
+        Flow::Next(req)
+    }
+
+    fn after(&self, res: Response) -> Response {
+        res
+    }
+}
